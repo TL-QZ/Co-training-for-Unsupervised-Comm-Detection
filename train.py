@@ -1,157 +1,284 @@
-import argparse
-import math
-import os.path as osp
-import random
-import time
-
 import numpy as np
+from torch_geometric.nn import Node2Vec
+import os.path as osp
 import torch
-import torch.nn.functional as F
-import yaml
+import matplotlib.pyplot as plt
 from sklearn import metrics
-from yaml import SafeLoader
+from sklearn.manifold import TSNE
+from torch_geometric.datasets import Planetoid
+from tqdm.notebook import tqdm
 
-from layers.MLP_Clustering import MLPCluster
-from loss import modularity_loss
-from model import TransformerEncoder
-from utility import data_process, best_map, get_dataset, load_wiki, load_synth_data
+from Model import GCN_Encoder, MLPCluster, TransformerEncoder
+from utility import graph_adj, best_map
 
 
-def parse_arguments():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--dataset', type=str, default='Synth1')
-    parser.add_argument('--gpu_id', type=int, default=0)
-    parser.add_argument('--config', type=str, default='config.yaml')
-    parser.add_argument('--path', type=str, default='.')
-    args = parser.parse_args()
-    return args
+def N2V_train():
+    N2V.train()
+    total_loss = 0
+    for pos_rw, neg_rw in N2V_loader:
+        N2V_optimizer.zero_grad()
+        loss = N2V.loss(pos_rw.to(device), neg_rw.to(device))
+        loss.backward()
+        N2V_optimizer.step()
+        total_loss += loss.item()
+    return total_loss / len(N2V_loader)
+
+
+def T_train(co_train=False, detail=False):
+    Transformer_encoder.train()
+    Transformer_cluster.train()
+    TC_optimizer.zero_grad()
+
+    z, z_sim = Transformer_encoder(data.x, mask=diag_mask)
+    c, c_sim = Transformer_cluster(z.squeeze(0), diag_mask)
+
+    loss_embed = Transformer_encoder.recons_loss(z_sim, adj)
+    loss_sim = Transformer_cluster.recons_loss(c_sim, adj)
+    loss_mod = Transformer_cluster.modul_loss(c, adj)
+    reg = Transformer_cluster.reg_term(c, n_nodes, n_class)
+    if co_train:
+        loss_clus = Transformer_cluster.soft_cross_entropy(c.log(), y)
+        loss = 1 * loss_embed + 1 * loss_sim + 0.0001 * loss_clus + 0.2 * loss_mod
+    else:
+        loss = 0.7 * loss_embed + 1 * loss_sim + 0.1 * loss_mod + 0.2 * reg
+
+    loss.backward()
+    TC_optimizer.step()
+    if detail:
+        print('\nEpoch:', epoch, 'full_loss: {:.5f}'.format(loss.item()),
+            'encoder_loss: {:.5f}'.format(loss_embed.item()), end=' ')
+
+    return loss
+
+
+def G_train(co_train=False, detail=False):
+    Encoder.train()
+    GCN_Cluster.train()
+    GC_optimizer.zero_grad()
+
+    x, x_sim = Encoder(n2v_embed, data.edge_index, diag_mask)
+    c, c_sim = GCN_Cluster(x, diag_mask)
+    loss_embed = Encoder.recons_loss(x_sim, adj)
+    loss_sim = GCN_Cluster.recons_loss(c_sim, adj)
+    loss_mod = GCN_Cluster.modul_loss(c, adj)
+    reg = GCN_Cluster.reg_term(c, n_nodes, n_class)
+    if co_train == True:
+        loss_clus = GCN_Cluster.soft_cross_entropy(c.log(), y)
+        loss = 1 * loss_embed + 1 * loss_sim + 0.0001 * loss_clus + 0.2 * loss_mod
+    #         loss = 1*loss_sim + 1*loss_clus + 1*loss_mod
+    else:
+        loss = 1 * loss_embed + 1 * loss_sim + 0.1 * loss_mod + 0.5 * reg
+    loss.backward()
+    GC_optimizer.step()
+    if detail:
+        print('\nEpoch:', epoch, 'full_loss: {:.5f}'.format(loss.item()),
+            'encoder_loss: {:.5f}'.format(loss_embed.item()), end=' ')
+
+    return loss
+
+def evalate():
+    y_pred = torch.argmax(c, dim=1).cpu().detach().numpy()
+    y_true = data.y.cpu().numpy()
+    y_pred = best_map(y_true, y_pred)
+    acc = metrics.accuracy_score(y_true, y_pred)
+    nmi = metrics.normalized_mutual_info_score(y_true, y_pred)
+    f1_macro = metrics.f1_score(y_true, y_pred, average='macro')
+    print("\n\nAc:", acc, "NMI:", nmi, "F1:", f1_macro)
+    return [acc, nmi, f1_macro]
 
 
 if __name__ == '__main__':
 
-    args = parse_arguments()
-    cfg = yaml.load(open(args.config), Loader=SafeLoader)[args.dataset]
+    # Data Loading
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    if torch.cuda.is_available():
-        torch.cuda.set_device(args.gpu_id)
-    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    dataset = 'Cora'
 
-    MODEL_PATH = args.path + "/saved_models/" + args.dataset + "/"
+    MODEL_PATH = osp.join(osp.expanduser('~'), 'PycharmProjects\CoTrain\model', dataset)
 
-    if args.dataset != "Wiki" and args.dataset != "Synth1":
-        path = osp.join(osp.expanduser('~'), 'PycharmProjects\Transformer_Community_Detection\data', args.dataset)
-        dataset = get_dataset(path, args.dataset)
-        data = dataset[0]
-        num_features = dataset.num_features
-    elif args.dataset == "Synth1":
-        path = osp.join(osp.expanduser('~'), 'PycharmProjects\Transformer_Community_Detection\data', args.dataset)
-        data, num_features = load_synth_data(path)
-    else:
-        path = osp.join(osp.expanduser('~'), 'PycharmProjects\Transformer_Community_Detection\data')
-        data, num_features = load_wiki(path)
-
+    path = osp.join(osp.expanduser('~'), 'PycharmProjects\CoTrain\data', dataset)
+    dataset = Planetoid(path, dataset)
+    data = dataset[0]
+    data.to(device)
     n_nodes = data.x.shape[0]
     n_class = max(data.y).item() + 1
+    n_features = data.x.shape[1]
 
-    print("========", args.dataset, "========")
-    print("Nodes    :", n_nodes)
-    print("Features :", num_features)
-    print("Classes  :", n_class)
-    print("Distribution :", end=' ')
-    for i in range(n_class-1):
-        print(torch.sum(data.y == i).item(), end=', ')
-    print(torch.sum(data.y == (n_class-1)).item(), end='\n')
-    print("======================")
+    adj = graph_adj(n_nodes, data.edge_index).to(device)
+    diag_mask = torch.eye(n_nodes, n_nodes, dtype=torch.bool).to(device)
 
-    items = data_process(data, device)
-    diag_mask = torch.eye(n_nodes).to(device)
+    # Hyper-params
+    emb_dim = 256
+
+    # Node2Vec Param
+    N2V_Epochs = 100
+    walk_length = 15
+    context_size = 10
+    walks_per_node = 5
+    num_negative_samples = 1
+    p = 5
+    q = 7
+
+    # GCN Param
+    GCN_Epochs = 300
+    out_channels = 126
+
+    # Transformer Param
+    T_Epochs = 500
+    raw_dim = n_features
+    input_dim = 256
+    num_layers = 1
+    num_heads = 4
+
+    # Cluster Param
+    hid_dim = 64
+    co_epoch = 300
 
     res = []
+    res_init = []
+    res_GNN =[]
+
+    # Node2Vec Train
+    print('_______________________________')
+    print('__Training Node2Vec__')
+    N2V = Node2Vec(data.edge_index, embedding_dim=emb_dim, walk_length=walk_length,
+                   context_size=context_size, walks_per_node=walks_per_node,
+                   num_negative_samples=num_negative_samples, p=p, q=q, sparse=True).to(device)
+    N2V_loader = N2V.loader(batch_size=128, shuffle=True, num_workers=0)
+    N2V_optimizer = torch.optim.SparseAdam(list(N2V.parameters()), lr=0.01)
+
+    for epoch in range(N2V_Epochs):
+        loss = N2V_train()
+        # print(f'Epoch: {epoch:02d}, Loss: {loss:.4f}')
+
+    n2v_embed = N2V()  # Node2Vec Embedding
+
     for _ in range(10):
-        Transformer_encoder = TransformerEncoder(raw_dim=num_features, input_dim=cfg["num_hidden"],
-                                                 num_layers=cfg["num_layers"],
-                                                 num_heads=cfg["num_heads"],
-                                                 dim_feedforward=4 * cfg["num_hidden"],
-                                                 dropout=cfg["dropout"]).to(device)
 
-        clustermodel = MLPCluster(input_dim=cfg["num_hidden"], hid_dim=cfg["cluster_hid_dim"], num_comm=n_class,
-                                  dropout=cfg["cluster_dropout"]).to(device)
-        fulloptimizer = torch.optim.Adam((list(Transformer_encoder.parameters()) + list(clustermodel.parameters())),
-                                         lr=cfg["learning_rate"], weight_decay=cfg["weight_decay"])
+        # Transformer Train
+        print('__Training Transformer__')
+        Transformer_encoder = TransformerEncoder(raw_dim=raw_dim, input_dim=input_dim,
+                                                 num_layers=num_layers, num_heads=num_heads,
+                                                 dim_feedforward=4 * input_dim).to(device)
 
-        show_loss = True
+        Transformer_cluster = MLPCluster(input_dim=input_dim, hid_dim=hid_dim, num_comm=n_class).to(device)
+
+        TC_optimizer = torch.optim.Adam((list(Transformer_encoder.parameters()) + list(Transformer_cluster.parameters())),
+                                        lr=0.001, weight_decay=0)
+
+        for p in Transformer_encoder.parameters():
+            if p.dim() > 1:
+                torch.nn.init.xavier_uniform_(p)
+
         best_loss = 1e9
-        bad_count = 0
-        patience = cfg["patience"]
-        Epochs = cfg["epochs"]
-        print("\n\n\nStarting final full training module")
-
-        start = time.time()
-
-        for epoch in range(Epochs + 1):
-            Transformer_encoder.train()
-            clustermodel.train()
-            fulloptimizer.zero_grad()
-
-            z, A_star = Transformer_encoder(items, mask=diag_mask)
-            c_dist, pred_similarity = clustermodel(z, items.Adj)
-
-            loss_embed = F.binary_cross_entropy(A_star, items.Adj)
-            loss_reg = torch.linalg.norm(c_dist.sum(1)) / n_nodes * math.sqrt(n_class) - 1
-
-            loss_sim = F.binary_cross_entropy(pred_similarity.squeeze(0), items.Adj)
-            loss_mod = modularity_loss(c_dist, items.Adj)
-            loss = 1.2 * loss_embed + 0.5 * loss_sim + 0.3 * loss_reg + 0.2 * loss_mod
-            loss.backward()
-            fulloptimizer.step()
-
-            if show_loss:
-                print('Epoch:', epoch, 'full_loss: {:.5f}'.format(loss.item()),
-                      'encoder_loss: {:.5f}'.format(loss_embed.item()), end=' ')
-                print('loss1: {:.5f}'.format(loss_sim.item()), 'loss2: {:.5f}'.format(loss_reg.item()),
-                      'loss3: {:.5f}'.format(loss_mod.item()), flush=True)
+        for epoch in range(300):
+            loss = T_train()
 
             if loss.item() < best_loss:
                 bad_count = 0
                 best_loss = loss.item()
                 torch.save(Transformer_encoder.state_dict(), MODEL_PATH + "encoder")
-                torch.save(clustermodel.state_dict(), MODEL_PATH + "clustermodel")
-            else:
-                bad_count += 1
-                print("Model not improved for", bad_count, "consecutive epochs..")
-                if bad_count == patience:
-                    print("Early stopping Cluster Train...")
-                    break
+                torch.save(Transformer_cluster.state_dict(), MODEL_PATH + "clustermodel")
 
-            if epoch % 10 == 0:
-                y_pred = torch.argmax(c_dist, dim=2).cpu().detach().numpy()
-                y_true = data.y.cpu().numpy()
-                y_pred = best_map(y_true, y_pred)
-                acc = metrics.accuracy_score(y_true, y_pred[0])
-                nmi = metrics.normalized_mutual_info_score(y_true, y_pred[0])
-                f1_macro = metrics.f1_score(y_true, y_pred[0], average='macro')
-                f1_micro = metrics.f1_score(y_true, y_pred[0], average='micro')
-                print("\n\nAc:", acc, "NMI:", nmi, "F1Ma:", f1_macro, "F1Mi:", f1_micro)
+            z, z_sim = Transformer_encoder(data.x, mask=diag_mask)
+            c, c_sim = Transformer_cluster(z.squeeze(0), diag_mask)
 
-        time_laps = time.time() - start
-        print("Training time length", time_laps)
+            if epoch % 50 == 0:
+                _ = evalate()
+
+        print("__ Evaluate Transformer__")
         Transformer_encoder.load_state_dict(torch.load(MODEL_PATH + "encoder"))
-        clustermodel.load_state_dict(torch.load(MODEL_PATH + "clustermodel"))
+        Transformer_cluster.load_state_dict(torch.load(MODEL_PATH + "clustermodel"))
         Transformer_encoder.eval()
-        clustermodel.eval()
-        z, A_star = Transformer_encoder(items)
-        c_dist, pred_similarity = clustermodel(z, items.Adj)
-        y_pred = torch.argmax(c_dist, dim=2).cpu().detach().numpy()
-        y_true = data.y.cpu().numpy()
-        y_pred = best_map(y_true, y_pred)
-        acc = metrics.accuracy_score(y_true, y_pred[0])
-        nmi = metrics.normalized_mutual_info_score(y_true, y_pred[0])
-        f1_macro = metrics.f1_score(y_true, y_pred[0], average='macro')
-        f1_micro = metrics.f1_score(y_true, y_pred[0], average='micro')
-        print("\n\nAc:", acc, "NMI:", nmi, "F1Ma:", f1_macro, "F1Mi:", f1_micro)
+        Transformer_cluster.eval()
+        z, z_sim = Transformer_encoder(data.x, mask=diag_mask)
+        c, _ = Transformer_cluster(z.squeeze(0), diag_mask)
 
-        res.append([acc, nmi, f1_macro])
+        t1_out = evalate()
+        res_init.append(t1_out)
+
+        # Co-training
+        for c_epoch in range(5):
+            print ('Co-train round: ', c_epoch)
+            z, z_sim = Transformer_encoder(data.x, mask=diag_mask)
+            c, _ = Transformer_cluster(z.squeeze(0), diag_mask)
+            y = c.detach()
+
+            Encoder = GCN_Encoder(in_channels=emb_dim, out_channels=out_channels, k=3).to(device)
+            GCN_Cluster = MLPCluster(input_dim=out_channels, hid_dim=hid_dim, num_comm=n_class).to(device)
+            GC_optimizer = torch.optim.Adam((list(Encoder.parameters()) + list(GCN_Cluster.parameters())), lr=0.001)
+
+            best_loss = 1e9
+            for epoch in range(100):
+                loss = G_train(co_train=True)
+
+                if loss.item() < best_loss:
+                    best_loss = loss.item()
+                    torch.save(Encoder.state_dict(), MODEL_PATH + "g_encoder")
+                    torch.save(GCN_Cluster.state_dict(), MODEL_PATH + "g_clustermodel")
+
+                x, x_sim = Encoder(n2v_embed, data.edge_index, diag_mask)
+                c, c_sim = GCN_Cluster(x, diag_mask)
+
+                if epoch % 50 == 0:
+                    y_pred = torch.argmax(c, dim=1).cpu().detach().numpy()
+                    y_true = data.y.cpu().numpy()
+                    y_pred = best_map(y_true, y_pred)
+                    acc = metrics.accuracy_score(y_true, y_pred)
+                    nmi = metrics.normalized_mutual_info_score(y_true, y_pred)
+                    f1_macro = metrics.f1_score(y_true, y_pred, average='macro')
+                    print("\n\nAc:", acc, "NMI:", nmi, "F1:", f1_macro)
+
+            Encoder.load_state_dict(torch.load(MODEL_PATH + "g_encoder"))
+            GCN_Cluster.load_state_dict(torch.load(MODEL_PATH + "g_clustermodel"))
+            Encoder.eval()
+            GCN_Cluster.eval()
+            x, x_sim = Encoder(n2v_embed, data.edge_index, diag_mask)
+            c, _ = GCN_Cluster(x, diag_mask)
+            print("__ GNN Evaluation__")
+            gnn_eval = evalate()
+            y = c.detach()
+
+            Transformer_encoder = TransformerEncoder(raw_dim=raw_dim, input_dim=input_dim,
+                                                     num_layers=num_layers, num_heads=num_heads,
+                                                     dim_feedforward=4 * input_dim).to(device)
+
+            Transformer_cluster = MLPCluster(input_dim=input_dim, hid_dim=hid_dim, num_comm=n_class).to(device)
+
+            TC_optimizer = torch.optim.Adam((list(Transformer_encoder.parameters()) + list(Transformer_cluster.parameters())),
+                                            lr=0.001, weight_decay=0)
+            best_loss = 1e9
+            for epoch in range(200):
+                loss = T_train(co_train=True)
+
+                if loss.item() < best_loss:
+                    best_loss = loss.item()
+                    torch.save(Transformer_encoder.state_dict(), MODEL_PATH + "encoder")
+                    torch.save(Transformer_cluster.state_dict(), MODEL_PATH + "clustermodel")
+
+                z, z_sim = Transformer_encoder(data.x, mask=diag_mask)
+                c, c_sim = Transformer_cluster(z.squeeze(0), diag_mask)
+
+                if epoch % 50 == 0:
+                    _ = evalate()
+
+        print("__ Final Evaluation__")
+        Transformer_encoder.load_state_dict(torch.load(MODEL_PATH + "encoder"))
+        Transformer_cluster.load_state_dict(torch.load(MODEL_PATH + "clustermodel"))
+        Transformer_encoder.eval()
+        Transformer_cluster.eval()
+        z, z_sim = Transformer_encoder(data.x, mask=diag_mask)
+        c, _ = Transformer_cluster(z.squeeze(0), diag_mask)
+
+        final = evalate()
+        res.append(final)
+        res_GNN.append(gnn_eval)
 
     res = np.array(res)
     print(res)
-    np.savetxt("transformer_syn_avg.csv", res, delimiter=",")
+    np.savetxt("cotrain_cora_avg7.csv", res, delimiter=",")
+    res_init = np.array(res_init)
+    res_GNN = np.array(res_GNN)
+    np.savetxt("cotrain_cora_init7.csv", res_init, delimiter=",")
+    np.savetxt("cotrain_cora_GNN7.csv", res_GNN, delimiter=",")
+
